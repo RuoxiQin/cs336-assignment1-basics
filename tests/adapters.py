@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections import OrderedDict, defaultdict, deque
+import logging
 import os
+import regex as re
 from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
 from jaxtyping import Float, Int
@@ -8,6 +11,10 @@ from jaxtyping import Float, Int
 import numpy.typing as npt
 import torch
 from torch import Tensor
+
+from cs336_basics.utils import find_chunk_boundaries
+
+logger = logging.getLogger(__name__)
 
 
 def run_linear(
@@ -589,4 +596,121 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    logger.info("Tokenizer started.")
+    # Initialize vocab with 256 bytes and special tokens.
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    for i, special_token in enumerate(special_tokens):
+        vocab[len(vocab) + i] = special_token.encode("utf-8")
+
+    # Split the input text by special_tokens.
+    with open(input_path, "r", encoding="utf-8") as f:
+        input_text = f.read()
+    split_pattern = "|".join(re.escape(special_token)
+                             for special_token in special_tokens)
+    text_parts = re.split(split_pattern, input_text)
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    words_frequency: dict[str, int] = defaultdict(int)
+    for text_part in text_parts:
+        # Pre-tokenization.
+        pre_tokenized_words = re.findall(PAT, text_part)
+        for word in pre_tokenized_words:
+            # Build words frequency table.
+            words_frequency[word] += 1
+    logger.info("Pre-tokenization completed.")
+    # Count byte-pair frequency.
+    # Double-linked list of the words bytes sequence. Only the left-most bytes of a merged bytes are valid.
+    # Note that this can be further optimized by storing word_frequency, words, words_bytes in a single object.
+    words: list[str] = []
+    words_bytes: list[list[bytes]] = []
+    next: list[list[int]] = []
+    prev: list[list[int]] = []
+    # Stores the bytes-pair to occurance (word_index, byte_position_index). Use OrderedDict to preserve insertion order so it can be
+    # popped in order. The value of OrderedDict is a dummy None. (Ideally we'd like OrderedSet)
+    bytes_pair_occurance: dict[tuple[bytes, bytes], OrderedDict[tuple[int, int], None]] = defaultdict(
+        OrderedDict)
+    bytes_pair_frequency: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    merges = []
+    for word_i, (word, count) in enumerate(words_frequency.items()):
+        words.append(word)
+        word_bytes = word.encode("utf-8")
+        words_bytes.append([word_bytes[i:i+1] for i in range(len(word_bytes))])
+        next.append([i for i in range(1, len(word_bytes))] + [-1])
+        prev.append([-1] + [i for i in range(len(word_bytes) - 1)])
+        for i in range(len(word_bytes) - 1):
+            bytes_pair = (bytes([word_bytes[i]]), bytes([word_bytes[i+1]]))
+            bytes_pair_frequency[bytes_pair] += count
+            bytes_pair_occurance[bytes_pair][(word_i, i)] = None
+    logger.info("Tokenizer initial frequency tables creation completed.")
+
+    def delete_bytes_pair_frequency(bytes_pair: tuple[bytes, bytes], count):
+        frequency = bytes_pair_frequency[bytes_pair]
+        assert frequency >= count, f"{bytes_pair} frequency {frequency} is lower than {count}."
+        if frequency > count:
+            bytes_pair_frequency[bytes_pair] -= word_frequency
+        else:
+            del bytes_pair_frequency[bytes_pair]
+
+    def delete_bytes_pair_occurance(bytes_pair: tuple[bytes, bytes], occurance: tuple[int, int]):
+        bytes_pair_occurance[bytes_pair].pop(occurance)
+        if not bytes_pair_occurance[bytes_pair]:
+            del bytes_pair_occurance[bytes_pair]
+
+    # BPE merge loop.
+    for vocab_i in range(len(vocab), vocab_size):
+        if vocab_i % 100 == 0:
+            logger.info(f"Starting BPE merge loop {vocab_i}.")
+        if not bytes_pair_frequency:
+            break
+        # Get the most frequent bytes_pair. If there is a tie, further sort lexicographically by bytes_pairs.
+        most_frequent_bytes_pair = max(
+            bytes_pair_frequency, key=lambda k: (bytes_pair_frequency[k], k))
+        merges.append(most_frequent_bytes_pair)
+        merged_bytes = most_frequent_bytes_pair[0] + \
+            most_frequent_bytes_pair[1]
+        vocab[vocab_i] = merged_bytes
+
+        # Update the merged byte-pairs and adjacent byte-pairs frequency tables.
+        while bytes_pair_occurance[most_frequent_bytes_pair]:
+            word_i, bytes_i = bytes_pair_occurance[most_frequent_bytes_pair].popitem(last=False)[
+                0]
+            second_bytes_i = next[word_i][bytes_i]
+            word_bytes = words_bytes[word_i]
+            word_frequency = words_frequency[words[word_i]]
+            assert word_bytes[bytes_i] == most_frequent_bytes_pair[0]
+            assert word_bytes[second_bytes_i] == most_frequent_bytes_pair[1]
+            # Update the bytes before the merged pair (if exists).
+            before_bytes_i = prev[word_i][bytes_i]
+            if before_bytes_i >= 0:
+                before_bytes = word_bytes[before_bytes_i]
+                delete_bytes_pair_frequency(
+                    (before_bytes, most_frequent_bytes_pair[0]), word_frequency)
+                delete_bytes_pair_occurance(
+                    (before_bytes, most_frequent_bytes_pair[0]), (word_i, before_bytes_i))
+                bytes_pair_frequency[(
+                    before_bytes, merged_bytes)] += word_frequency
+                bytes_pair_occurance[(before_bytes, merged_bytes)][(
+                    word_i, before_bytes_i)] = None
+            # Update the bytes after the merged pair (if exists).
+            after_bytes_i = next[word_i][second_bytes_i]
+            if after_bytes_i >= 0:
+                next_bytes = word_bytes[after_bytes_i]
+                delete_bytes_pair_frequency(
+                    (most_frequent_bytes_pair[1], next_bytes), word_frequency)
+                delete_bytes_pair_occurance(
+                    (most_frequent_bytes_pair[1], next_bytes), (word_i, second_bytes_i))
+                bytes_pair_frequency[(
+                    merged_bytes, next_bytes)] += word_frequency
+                bytes_pair_occurance[(merged_bytes, next_bytes)
+                                     ][(word_i, bytes_i)] = None
+            # Update double-linked list pointers
+            next[word_i][bytes_i] = after_bytes_i
+            if after_bytes_i >= 0:
+                prev[word_i][after_bytes_i] = bytes_i
+            # Update word_bytes with the merged bytes and delete itself from the frequency tables.
+            word_bytes[bytes_i] = merged_bytes
+            delete_bytes_pair_frequency(
+                most_frequent_bytes_pair, word_frequency)
+            # No need to remove from bytes_pair_occurance because it's already popped at beginning of the loop.
+        del bytes_pair_occurance[most_frequent_bytes_pair]
+
+    return vocab, merges
