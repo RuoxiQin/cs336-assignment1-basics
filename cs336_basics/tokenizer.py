@@ -265,6 +265,7 @@ def train_bpe(
                 prev[word_i][after_bytes_i] = bytes_i
             # Update word_bytes with the merged bytes and delete itself from the frequency tables.
             word_bytes[bytes_i] = merged_bytes
+            word_bytes[second_bytes_i] = b""
             reduce_bytes_pair_frequency(
                 most_frequent_bytes_pair, word_frequency)
             # No need to remove from bytes_pair_occurance because it's already popped at beginning of the loop.
@@ -354,12 +355,13 @@ class BPETokenizer:
             while bytes_pair_occurance[bytes_pair]:
                 text_i, word_i, bytes_i = bytes_pair_occurance[bytes_pair].popitem(last=False)[
                     0]
+                word_bytes = words_bytes[text_i][word_i]
                 second_bytes_i = next[text_i][word_i][bytes_i]
                 merged_bytes = bytes_pair[0] + bytes_pair[1]
                 # Update occurance of bytes before bytes-pair.
                 before_bytes_i = prev[text_i][word_i][bytes_i]
                 if before_bytes_i >= 0:
-                    before_bytes = words_bytes[text_i][word_i][before_bytes_i]
+                    before_bytes = word_bytes[before_bytes_i]
                     delete_bytes_pair_occurance(
                         (before_bytes, bytes_pair[0]), (text_i, word_i, before_bytes_i))
                     bytes_pair_occurance[(before_bytes, merged_bytes)][(
@@ -367,7 +369,7 @@ class BPETokenizer:
                 # Update occurance of bytes after bytes-pair.
                 after_bytes_i = next[text_i][word_i][second_bytes_i]
                 if after_bytes_i >= 0:
-                    after_bytes = words_bytes[text_i][word_i][after_bytes_i]
+                    after_bytes = word_bytes[after_bytes_i]
                     delete_bytes_pair_occurance(
                         (bytes_pair[1], after_bytes), (text_i, word_i, second_bytes_i))
                     bytes_pair_occurance[(merged_bytes, after_bytes)][(
@@ -377,8 +379,8 @@ class BPETokenizer:
                 if after_bytes_i >= 0:
                     prev[text_i][word_i][after_bytes_i] = bytes_i
                 # Update merged bytes-pair.
-                words_bytes[text_i][word_i][bytes_i] = merged_bytes
-                words_bytes[text_i][word_i][second_bytes_i] = b""
+                word_bytes[bytes_i] = merged_bytes
+                word_bytes[second_bytes_i] = b""
 
         logger.info("Started converting merged bytes to encoding integer.")
         text_encode: list[list[int]] = [[] for _ in range(len(words_bytes))]
