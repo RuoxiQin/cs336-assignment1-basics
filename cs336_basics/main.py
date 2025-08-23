@@ -1,5 +1,5 @@
 import logging
-from cs336_basics.tokenizer import train_bpe_on_tinystoriesv2_train, load_vocab_and_merges
+from cs336_basics.tokenizer import train_bpe_on_tinystoriesv2_train, load_vocab_and_merges, BPETokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,10 @@ if __name__ == "__main__":
         ]
     )
 
-    train_bpe_on_tinystoriesv2_train()
+    # train_bpe_on_tinystoriesv2_train()
     vocab, merges = load_vocab_and_merges("data/TinyStoriesV2-GPT4-train.txt")
-    print(vocab)
-    print(merges)
+    tokenizer = BPETokenizer.from_files(
+        "data/TinyStoriesV2-GPT4-train-vocab.pkl", "data/TinyStoriesV2-GPT4-train-merges.pkl")
+    encoding_result = tokenizer.encode("🙃")
+    print(encoding_result)
+    print(tokenizer.decode(encoding_result))
