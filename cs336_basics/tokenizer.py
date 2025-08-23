@@ -1,4 +1,5 @@
 from collections import OrderedDict, defaultdict
+from collections.abc import Iterable, Iterator
 import heapq
 import logging
 import os
@@ -214,12 +215,11 @@ def train_bpe(
     for vocab_i in range(len(vocab), vocab_size):
         if vocab_i % 100 == 0:
             logger.info(f"Starting BPE merge loop {vocab_i}.")
-        if not bytes_pair_frequency:
-            break
         # Get the most frequent bytes_pair. If there is a tie, further sort lexicographically by bytes_pairs.
         most_frequent_bytes_pair = get_most_frequent_bytes_pair()
         if not most_frequent_bytes_pair:
-            logger.warning("Empty most_frequent_bytes_pair!!!")
+            logger.warning(
+                f"Empty most_frequent_bytes_pair. Not enough vocab for vocab_size {vocab_size}.")
             break
         merges.append(most_frequent_bytes_pair)
         merged_bytes = most_frequent_bytes_pair[0] + \
@@ -271,3 +271,152 @@ def train_bpe(
         del bytes_pair_occurance[most_frequent_bytes_pair]
 
     return vocab, merges
+
+
+class BPETokenizer:
+    vocab: dict[int, bytes] = {}
+    reverse_vocab: dict[bytes, int] = {}
+    merges: list[tuple[bytes, bytes]] = []
+    special_tokens: list[str] = []
+    special_tokens_set: set[str] = set()
+    PAT: str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+        self.vocab = vocab
+        self.reverse_vocab = {v: k for k, v in vocab.items()}
+        self.merges = merges
+        if special_tokens:
+            # Sort the special_tokens by length so if one special token is part of another, the longer
+            # one is used to split. E.g. "<|endoftext|><|endoftext|>" is preferred over "<|endoftext|>".
+            # Or "aba" is preferred over "b".
+            self.special_tokens = sorted(special_tokens, key=len, reverse=True)
+            self.special_tokens_set = set(special_tokens)
+
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
+        with open(vocab_filepath, "rb") as f:
+            vocab: dict[int, bytes] = pickle.load(f)
+        with open(merges_filepath, "rb") as f:
+            merges: list[tuple[bytes, bytes]] = pickle.load(f)
+        return BPETokenizer(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        logger.info("Started BPE encoding.")
+        # Split pattern that also keep special token strings as an individual element.
+        # Note that empty split_pattern raises error.
+        if self.special_tokens:
+            split_pattern = "(" + "|".join(re.escape(special_token)
+                                           for special_token in self.special_tokens) + ")"
+            text_parts: list[str] = re.split(split_pattern, text)
+        else:
+            text_parts: list[str] = [text]
+
+        bytes_pair_occurance: dict[tuple[bytes, bytes],
+                                   OrderedDict[tuple[int, int, int], None]] = defaultdict(OrderedDict)
+        # [text_part_i][word_i][bytes_i]
+        words_bytes: list[list[list[bytes]]] = []
+        next: list[list[list[int]]] = []
+        prev: list[list[list[int]]] = []
+
+        logger.info("Started building encoding index.")
+        for text_i, text_part in enumerate(text_parts):
+            words_bytes.append([])
+            next.append([])
+            prev.append([])
+            # If the text_part is special token (it is guaranteed to be split as an individual part),
+            # Then convert it as a single word with full bytes. This bytes will exist in the reverse_vocab
+            # so it can be processed as normal bytes below.
+            if text_part in self.special_tokens_set:
+                words_bytes[-1].append([text_part.encode("utf-8")])
+                next[-1].append([-1])
+                prev[-1].append([-1])
+                continue
+            # Pre-tokenization to split text_part into words and encode to bytes list.
+            pre_tokenized_words = re.findall(self.PAT, text_part)
+            for word_i, word in enumerate(pre_tokenized_words):
+                word_bytes = word.encode("utf-8")
+                words_bytes[-1].append([word_bytes[i:i+1]
+                                        for i in range(len(word_bytes))])
+                next[-1].append([i for i in range(1, len(word_bytes))] + [-1])
+                prev[-1].append([-1] + [i for i in range(len(word_bytes) - 1)])
+                for bytes_i in range(len(word_bytes) - 1):
+                    bytes_pair_occurance[(
+                        word_bytes[bytes_i:bytes_i+1], word_bytes[bytes_i+1:bytes_i+2])][(text_i, word_i, bytes_i)] = None
+
+        logger.info("Started encoding.")
+
+        def delete_bytes_pair_occurance(bytes_pair: tuple[bytes, bytes], occurance: tuple[int, int, int]):
+            bytes_pair_occurance[bytes_pair].pop(occurance)
+            if not bytes_pair_occurance[bytes_pair]:
+                del bytes_pair_occurance[bytes_pair]
+
+        for bytes_pair in self.merges:
+            while bytes_pair_occurance[bytes_pair]:
+                text_i, word_i, bytes_i = bytes_pair_occurance[bytes_pair].popitem(last=False)[
+                    0]
+                second_bytes_i = next[text_i][word_i][bytes_i]
+                merged_bytes = bytes_pair[0] + bytes_pair[1]
+                # Update occurance of bytes before bytes-pair.
+                before_bytes_i = prev[text_i][word_i][bytes_i]
+                if before_bytes_i >= 0:
+                    before_bytes = words_bytes[text_i][word_i][before_bytes_i]
+                    delete_bytes_pair_occurance(
+                        (before_bytes, bytes_pair[0]), (text_i, word_i, before_bytes_i))
+                    bytes_pair_occurance[(before_bytes, merged_bytes)][(
+                        text_i, word_i, before_bytes_i)] = None
+                # Update occurance of bytes after bytes-pair.
+                after_bytes_i = next[text_i][word_i][second_bytes_i]
+                if after_bytes_i >= 0:
+                    after_bytes = words_bytes[text_i][word_i][after_bytes_i]
+                    delete_bytes_pair_occurance(
+                        (bytes_pair[1], after_bytes), (text_i, word_i, second_bytes_i))
+                    bytes_pair_occurance[(merged_bytes, after_bytes)][(
+                        text_i, word_i, bytes_i)] = None
+                # Update double-linked list.
+                next[text_i][word_i][bytes_i] = after_bytes_i
+                if after_bytes_i >= 0:
+                    prev[text_i][word_i][after_bytes_i] = bytes_i
+                # Update merged bytes-pair.
+                words_bytes[text_i][word_i][bytes_i] = merged_bytes
+                words_bytes[text_i][word_i][second_bytes_i] = b""
+
+        logger.info("Started converting merged bytes to encoding integer.")
+        text_encode: list[list[int]] = [[] for _ in range(len(words_bytes))]
+        for text_i in range(len(words_bytes)):
+            for word_i in range(len(words_bytes[text_i])):
+                bytes_i = 0
+                while bytes_i >= 0:
+                    text_encode[text_i].append(
+                        self.reverse_vocab[words_bytes[text_i][word_i][bytes_i]])
+                    bytes_i = next[text_i][word_i][bytes_i]
+
+        return [encode for words_encode in text_encode for encode in words_encode]
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        current_text = ""
+        for char in iterable:
+            current_text += char
+            # Check if this is a special token.
+            if current_text in self.special_tokens_set:
+                encoded_text = self.encode(current_text)
+                for encoding_int in encoded_text:
+                    yield encoding_int
+                current_text = ""
+
+            # Check if the current text can be split into multiple words (therefore has hit the PAT boundary).
+            pre_tokenized_words: list[str] = re.findall(self.PAT, current_text)
+            if len(pre_tokenized_words) < 2 or (not pre_tokenized_words[0]):
+                continue
+            else:
+                encoded_text = self.encode(pre_tokenized_words[0])
+                for encoding_int in encoded_text:
+                    yield encoding_int
+                current_text = "".join(pre_tokenized_words[1:])
+
+        # Encode any remaining text.
+        encoded_text = self.encode(current_text)
+        for encoding_int in encoded_text:
+            yield encoding_int
+
+    def decode(self, ids: list[int]) -> str:
+        return b"".join([self.vocab[encoding] for encoding in ids]).decode("utf-8", errors="replace")
