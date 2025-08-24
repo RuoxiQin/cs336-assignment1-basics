@@ -1,5 +1,5 @@
 import logging
-from cs336_basics.tokenizer import train_bpe_on_tinystoriesv2_train, load_vocab_and_merges, BPETokenizer
+from cs336_basics.tokenizer import train_bpe_on_tinystoriesv2_train, load_vocab_and_merges, BPETokenizer, train_bpe_on_tinystoriesv2_valid
 
 logger = logging.getLogger(__name__)
 
@@ -16,9 +16,17 @@ if __name__ == "__main__":
     )
 
     # train_bpe_on_tinystoriesv2_train()
-    vocab, merges = load_vocab_and_merges("data/TinyStoriesV2-GPT4-train.txt")
+    # train_bpe_on_tinystoriesv2_valid()
+
+    vocab, merges = load_vocab_and_merges("data/TinyStoriesV2-GPT4-valid.txt")
+    # print(vocab)
     tokenizer = BPETokenizer.from_files(
-        "data/TinyStoriesV2-GPT4-train-vocab.pkl", "data/TinyStoriesV2-GPT4-train-merges.pkl")
-    encoding_result = tokenizer.encode("🙃")
-    print(encoding_result)
-    print(tokenizer.decode(encoding_result))
+        "data/TinyStoriesV2-GPT4-valid-vocab.pkl", "data/TinyStoriesV2-GPT4-valid-merges.pkl", ["<|endoftext|><|endoftext|>", "<|endoftext|>"])
+    test_string = "Hello, how <|endoftext|><|endoftext|> are you?<|endoftext|>"
+    ids_together = tokenizer.encode(test_string)
+    ids = []
+    for id in tokenizer.encode_iterable(test_string):
+        ids.append(id)
+    tokenized_string = [tokenizer.decode([x]) for x in ids]
+    print(tokenized_string)
+    print(ids_together == ids)
