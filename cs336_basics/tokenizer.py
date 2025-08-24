@@ -1,4 +1,4 @@
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterable, Iterator
 import heapq
 import logging
@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import pickle
 import regex as re
-from typing import BinaryIO
+from typing import BinaryIO, Deque
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,7 @@ def train_bpe_on_tinystoriesv2_train():
 
 
 def train_bpe_on_tinystoriesv2_valid():
-    return train_bpe_on_data("data/TinyStoriesV2-GPT4-valid.txt", 10000, ["<|endoftext|>"])
+    return train_bpe_on_data("data/TinyStoriesV2-GPT4-valid.txt", 10000, ["<|endoftext|><|endoftext|>", "<|endoftext|>"])
 
 
 def train_bpe_on_owt_train():
@@ -125,8 +125,8 @@ def train_bpe(
     logger.info("Tokenizer started.")
     # Initialize vocab with 256 bytes and special tokens.
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-    for i, special_token in enumerate(special_tokens):
-        vocab[len(vocab) + i] = special_token.encode("utf-8")
+    for special_token in special_tokens:
+        vocab[len(vocab)] = special_token.encode("utf-8")
 
     # Split the input text by special_tokens.
     with open(input_path, "r", encoding="utf-8") as f:
@@ -278,8 +278,14 @@ class BPETokenizer:
     vocab: dict[int, bytes] = {}
     reverse_vocab: dict[bytes, int] = {}
     merges: list[tuple[bytes, bytes]] = []
-    special_tokens: list[str] = []
-    special_tokens_set: set[str] = set()
+    special_tokens: set[str] = set()
+    # Map from special token prefix strings to special tokens.
+    special_tokens_by_prefix: dict[str, set[str]] = defaultdict(set)
+    # Special token that is a prefix of another longer special token.
+    # E.g. "<|endoftext|>" can be extended to "<|endoftext|><|endoftext|>".
+    extensible_special_tokens: set[str] = set()
+    longest_special_token_length: int = 0
+    special_tokens_split_pattern = ""
     PAT: str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
@@ -287,11 +293,26 @@ class BPETokenizer:
         self.reverse_vocab = {v: k for k, v in vocab.items()}
         self.merges = merges
         if special_tokens:
+            # The split pattern keeps the special token as a split result as well.
             # Sort the special_tokens by length so if one special token is part of another, the longer
             # one is used to split. E.g. "<|endoftext|><|endoftext|>" is preferred over "<|endoftext|>".
             # Or "aba" is preferred over "b".
-            self.special_tokens = sorted(special_tokens, key=len, reverse=True)
-            self.special_tokens_set = set(special_tokens)
+            self.special_tokens_split_pattern = "(" + "|".join(re.escape(special_token)
+                                                               for special_token in sorted(special_tokens, key=len, reverse=True)) + ")"
+            self.special_tokens = set(special_tokens)
+            self.longest_special_token_length = max(
+                len(s) for s in special_tokens)
+
+            for special_token in self.special_tokens:
+                for i in range(len(special_token)):
+                    self.special_tokens_by_prefix[special_token[:i+1]
+                                                  ].add(special_token)
+
+            for shorter_special_token in self.special_tokens:
+                for longer_special_token in self.special_tokens:
+                    if shorter_special_token != longer_special_token and longer_special_token.startswith(shorter_special_token):
+                        self.extensible_special_tokens.add(
+                            shorter_special_token)
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
@@ -305,16 +326,15 @@ class BPETokenizer:
         logger.info("Started BPE encoding.")
         # Split pattern that also keep special token strings as an individual element.
         # Note that empty split_pattern raises error.
-        if self.special_tokens:
-            split_pattern = "(" + "|".join(re.escape(special_token)
-                                           for special_token in self.special_tokens) + ")"
-            text_parts: list[str] = re.split(split_pattern, text)
+        if self.special_tokens_split_pattern:
+            text_parts: list[str] = re.split(
+                self.special_tokens_split_pattern, text)
         else:
             text_parts: list[str] = [text]
 
         bytes_pair_occurance: dict[tuple[bytes, bytes],
                                    OrderedDict[tuple[int, int, int], None]] = defaultdict(OrderedDict)
-        # [text_part_i][word_i][bytes_i]
+        # Index by [text_part_i][word_i][bytes_i].
         words_bytes: list[list[list[bytes]]] = []
         next: list[list[list[int]]] = []
         prev: list[list[list[int]]] = []
@@ -327,7 +347,7 @@ class BPETokenizer:
             # If the text_part is special token (it is guaranteed to be split as an individual part),
             # Then convert it as a single word with full bytes. This bytes will exist in the reverse_vocab
             # so it can be processed as normal bytes below.
-            if text_part in self.special_tokens_set:
+            if text_part in self.special_tokens:
                 words_bytes[-1].append([text_part.encode("utf-8")])
                 next[-1].append([-1])
                 prev[-1].append([-1])
@@ -395,30 +415,35 @@ class BPETokenizer:
         return [encode for words_encode in text_encode for encode in words_encode]
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        current_text = ""
-        for char in iterable:
-            current_text += char
-            # Check if this is a special token.
-            if current_text in self.special_tokens_set:
-                encoded_text = self.encode(current_text)
-                for encoding_int in encoded_text:
-                    yield encoding_int
-                current_text = ""
+        buffer: str = ""
 
-            # Check if the current text can be split into multiple words (therefore has hit the PAT boundary).
-            pre_tokenized_words: list[str] = re.findall(self.PAT, current_text)
-            if len(pre_tokenized_words) < 2 or (not pre_tokenized_words[0]):
-                continue
-            else:
-                encoded_text = self.encode(pre_tokenized_words[0])
-                for encoding_int in encoded_text:
-                    yield encoding_int
-                current_text = "".join(pre_tokenized_words[1:])
+        for new_text in iterable:
+            buffer += new_text
+            matched_special_token_prefix_negative_index = 0
+            # Check whether buffer ends at the middle of a special token.
+            # To do this, only need to check the last `longest_special_token_length` chars, staring
+            # from the left-most position.
+            for i in range(min(self.longest_special_token_length, len(buffer)), 0, -1):
+                if buffer[-i:] in self.special_tokens_by_prefix:
+                    if buffer[-i:] in self.special_tokens and buffer[-i:] not in self.extensible_special_tokens:
+                        # The buffer ends with a full non-extensible special token. The full buffer can run BPE.
+                        yield from self.encode(buffer)
+                        buffer = ""
+                        break
+                    # Otherwise, the buffer might ends in the middle of special token. It's only safe to process
+                    # chars before -i.
+                    matched_special_token_prefix_negative_index = i
+                    break
+            # The buffer[:-matched_special_token_prefix_index] is normal and can be used for BPE.
+            pre_tokenized_words: list[str] = re.findall(
+                self.PAT, buffer[:len(buffer)-matched_special_token_prefix_negative_index])
+            if len(pre_tokenized_words) > 1 and pre_tokenized_words[0]:
+                text_to_process = "".join(pre_tokenized_words[:-1])
+                yield from self.encode(text_to_process)
+                buffer = buffer.removeprefix(text_to_process)
 
         # Encode any remaining text.
-        encoded_text = self.encode(current_text)
-        for encoding_int in encoded_text:
-            yield encoding_int
+        yield from self.encode(buffer)
 
     def decode(self, ids: list[int]) -> str:
         return b"".join([self.vocab[encoding] for encoding in ids]).decode("utf-8", errors="replace")
