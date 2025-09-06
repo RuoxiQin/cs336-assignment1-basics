@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from cs336_basics.tokenizer import BPETokenizer, train_bpe
+from cs336_basics.basic_modules import Linear
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,12 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    linear = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
+    # Weight assignment is not allowed if it's part of grad computation (because that can only be updated via training).
+    with torch.no_grad():
+        linear.weight.copy_(weights)
 
-    raise NotImplementedError
+    return linear(in_features)
 
 
 def run_embedding(
