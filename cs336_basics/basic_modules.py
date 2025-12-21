@@ -86,6 +86,7 @@ class RotaryPositionalEmbedding(nn.Module):
         # d_k is the dimension of the key or query vectors
         assert d_k % 2 == 0
         self.d_k = d_k
+        self.max_seq_len = max_seq_len
         # A list of thetas [theta_0, theta_1, ..., theta_(d_k/2 - 1)].
         # Note that this is not the same as the textbook PDF. But turns out this is the one that unit test uses and it's the conanical one.
         thetas_by_k = theta ** (-1 * (2 * torch.arange(d_k//2)) / d_k)
@@ -93,7 +94,7 @@ class RotaryPositionalEmbedding(nn.Module):
         positions_by_i = torch.arange(max_seq_len)
         # thetas_by_i_k is a matrix of shape (max_seq_len, d_k/2). It's an index
         thetas_by_i_k = einsum(positions_by_i, thetas_by_k,
-                               "seq_len, d_k_half -> seq_len d_k_half")
+                               "max_seq_len, d_k_half -> max_seq_len d_k_half")
         cos_by_i_k = torch.cos(thetas_by_i_k)
         sin_by_i_k = torch.sin(thetas_by_i_k)
         # Register the pre-computed cos and sin values as buffers. They are not parameters because they are not learned.
@@ -106,6 +107,9 @@ class RotaryPositionalEmbedding(nn.Module):
 
     def forward(self, x: Float[torch.Tensor, "... seq_len d_k"], token_positions: Int[torch.Tensor, "... seq_len"]) -> Float[torch.Tensor, "... seq_len d_k"]:
         assert x.size(-1) == self.d_k
+        seq_len = x.size(-2)
+        assert seq_len <= self.max_seq_len
+
         # Note that odd is becuase it's odd for 1-based indexing.
         x_i_odd = x[..., 0::2]
         x_i_even = x[..., 1::2]
@@ -116,15 +120,15 @@ class RotaryPositionalEmbedding(nn.Module):
         # Shape [..., seq_len, d_k_half]
         index = index.expand(*token_positions.shape, self.d_k//2)
 
+        # The cos_by_i_k is a cache for max_seq_len. The actual input usually has a shorter seq_len.
+        # So we only need to utilize part of the cache.
+        cos_by_i_k = self.cos_by_i_k[:seq_len, ...]
+        sin_by_i_k = self.sin_by_i_k[:seq_len, ...]
         # Expand the cos_by_i_k and sin_by_i_k to shape [..., max_seq_len, d_k/2] to match the slicing dimension.
-        if token_positions.dim() == 1:
-            # "..." is empty, no need to change exapnd shape.
-            cos_by_i_k = self.cos_by_i_k
-            sin_by_i_k = self.sin_by_i_k
-        else:
-            cos_by_i_k = self.cos_by_i_k.unsqueeze(0)
+        if token_positions.dim() > 1:
+            cos_by_i_k = cos_by_i_k.unsqueeze(0)
             cos_by_i_k = cos_by_i_k.expand(*token_positions.shape, self.d_k//2)
-            sin_by_i_k = self.sin_by_i_k.unsqueeze(0)
+            sin_by_i_k = sin_by_i_k.unsqueeze(0)
             sin_by_i_k = sin_by_i_k.expand(*token_positions.shape, self.d_k//2)
         # Slice along the seq_len dimension. Since the last dimension is just the same integer repeated d_k/2 times, the same index will be used for the entire vector of d_k/2 lengh.
         reordered_cos_by_i_k = torch.gather(cos_by_i_k, dim=-2, index=index)
@@ -164,3 +168,51 @@ def scaled_dot_product_attention(
         QK = QK.masked_fill(~mask, float("-inf"))
     similarity_weight = softmax(QK / (d_k)**0.5, dim=-1)
     return einsum(similarity_weight, V, "... queries keys, ... keys d_v -> ... queries d_v")
+
+
+class CausalMultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, theta: float | None = None, max_seq_len: int | None = None) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        assert d_model % num_heads == 0
+        self.d_k = d_model // num_heads
+        self.d_v = self.d_k
+
+        self.linear_Q = Linear(self.d_model, num_heads * self.d_k)
+        self.linear_K = Linear(self.d_model, num_heads * self.d_k)
+        self.linear_V = Linear(self.d_model, num_heads * self.d_v)
+        self.linear_O = Linear(num_heads * self.d_v, self.d_model)
+
+        self.positional_embedding = None
+        if theta and max_seq_len:
+            self.positional_embedding = RotaryPositionalEmbedding(
+                theta, self.d_k, max_seq_len)
+
+    def forward(self, x: Float[Tensor, " ... seq_len d_model"], token_positions: Int[torch.Tensor, "... seq_len"] | None = None):
+        assert x.size(-1) == self.d_model
+        seq_len = x.size(-2)
+
+        # Recover the Q, K, V from the concatenated matrix.
+        Q = rearrange(self.linear_Q(
+            x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads)
+        K = rearrange(self.linear_K(
+            x), "... seq_len (num_heads d_k) -> ... num_heads seq_len d_k", num_heads=self.num_heads)
+        V = rearrange(self.linear_V(
+            x), "... seq_len (num_heads d_v) -> ... num_heads seq_len d_v", num_heads=self.num_heads)
+
+        if token_positions is not None:
+            assert self.positional_embedding is not None
+            Q = self.positional_embedding(Q, token_positions)
+            K = self.positional_embedding(K, token_positions)
+
+        # causal_mask allows Query token to attend to itself and all tokens before it.
+        causal_mask = torch.tril(torch.ones(
+            seq_len, seq_len, dtype=torch.bool), diagonal=0)
+        causal_mask.unsqueeze(0)
+        causal_mask = causal_mask.expand(*K.shape[:-2], seq_len, seq_len)
+
+        attentioned_value = scaled_dot_product_attention(Q, K, V, causal_mask)
+        concatenated_attentioned_value = rearrange(
+            attentioned_value, "... num_heads seq_len d_v -> ... seq_len (num_heads d_v)")
+        return self.linear_O(concatenated_attentioned_value)
