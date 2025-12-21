@@ -143,3 +143,9 @@ class RotaryPositionalEmbedding(nn.Module):
         # Merge the last two dimensions by alternatingly taking elements from each. Shape: [..., seq_len, d_k].
         return rearrange(
             stacked_new_x_odd_even, "... seq_len d_k_half two -> ... seq_len (d_k_half two)")
+
+
+def softmax(x: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+    x = x - x.amax(dim, keepdim=True)
+    exp_x = torch.exp(x)
+    return exp_x / exp_x.sum(dim, keepdim=True)
