@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.tokenizer import BPETokenizer, train_bpe
-from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU
+from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-    linear = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
+    linear = Linear(d_in, d_out, dtype=weights.dtype)
     # Weight assignment is not allowed if it's part of grad computation (because that can only be updated via training).
     with torch.no_grad():
         linear.weight.copy_(weights)
@@ -60,7 +60,7 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-    embedding = Embedding(vocab_size, d_model, weights.device, weights.dtype)
+    embedding = Embedding(vocab_size, d_model, dtype=weights.dtype)
     with torch.no_grad():
         embedding.weight.copy_(weights)
     return embedding(token_ids)
@@ -88,7 +88,7 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    swiglu = SwiGLU(d_model, d_ff, w1_weight.device, w1_weight.dtype)
+    swiglu = SwiGLU(d_model, d_ff, dtype=w1_weight.dtype)
     with torch.no_grad():
         swiglu.w1_weight.copy_(w1_weight)
         swiglu.w2_weight.copy_(w2_weight)
@@ -210,7 +210,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope_embedding = RotaryPositionalEmbedding(theta, d_k, max_seq_len)
+    return rope_embedding(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
