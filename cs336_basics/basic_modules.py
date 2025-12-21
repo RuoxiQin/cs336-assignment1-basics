@@ -2,7 +2,7 @@ import math
 import torch
 from torch import nn, Tensor
 from einops import einsum, rearrange
-from jaxtyping import Float, Int
+from jaxtyping import Float, Int, Bool
 
 
 class Linear(nn.Module):
@@ -149,3 +149,18 @@ def softmax(x: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     x = x - x.amax(dim, keepdim=True)
     exp_x = torch.exp(x)
     return exp_x / exp_x.sum(dim, keepdim=True)
+
+
+def scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys d_k"],
+    V: Float[Tensor, " ... keys d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    d_k = Q.size(-1)
+    QK = einsum(Q, K, "... queries d_k, ... keys d_k -> ... queries keys")
+    if mask is not None:
+        # mask=True means the attention should be propogated, i.e. don't fill with -inf.
+        QK = QK.masked_fill(~mask, float("-inf"))
+    similarity_weight = softmax(QK / (d_k)**0.5, dim=-1)
+    return einsum(similarity_weight, V, "... queries keys, ... keys d_v -> ... queries d_v")
