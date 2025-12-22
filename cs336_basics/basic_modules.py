@@ -302,8 +302,8 @@ class AdamW(torch.optim.Optimizer):
                 v = betas[1] * v + (1.0-betas[1]) * grad ** 2
                 alpha_t = lr * \
                     math.sqrt(1 - betas[1] ** t) / (1 - betas[0] ** t)
-                p.data -= alpha_t * m / (torch.sqrt(v) + eps)
-                p.data *= 1 - lr * weight_decay
+                p.data.sub_(alpha_t * m / (torch.sqrt(v) + eps))
+                p.data.mul_(1 - lr * weight_decay)
 
                 state["t"] = t + 1
                 state["m"] = m
@@ -322,3 +322,22 @@ def get_lr_cosine_schedule(it: int,
     if it <= cosine_cycle_iters:
         return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + math.cos(math.pi * (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)))
     return min_learning_rate
+
+
+@torch.no_grad()
+def clip_gradient(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6) -> None:
+    """
+    Clip gradient in-place.
+
+    The l2_norm is computed as if all paramters concatenates to a single vector and then compute its l2_norm.
+    """
+    total_l2_norm_square: float = 0.0
+    for param in parameters:
+        if param.grad is not None:
+            total_l2_norm_square += param.grad.norm(p=2).item() ** 2
+    total_l2_norm = total_l2_norm_square ** 0.5
+    if total_l2_norm > max_l2_norm:
+        scale_factor = max_l2_norm / (total_l2_norm + eps)
+        for param in parameters:
+            if param.grad is not None:
+                param.grad.mul_(scale_factor)

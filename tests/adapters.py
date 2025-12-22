@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.tokenizer import BPETokenizer, train_bpe
-from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock, TransformerLM, cross_entropy, AdamW, get_lr_cosine_schedule
+from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock, TransformerLM, cross_entropy, AdamW, get_lr_cosine_schedule, clip_gradient
 
 logger = logging.getLogger(__name__)
 
@@ -539,7 +539,7 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    clip_gradient(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
