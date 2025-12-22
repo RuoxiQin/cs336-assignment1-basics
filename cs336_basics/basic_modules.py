@@ -2,11 +2,12 @@ import math
 import torch
 from torch import nn, Tensor
 from collections.abc import Callable, Iterable
-from typing import Optional, Any
+from typing import Optional, Any, BinaryIO, IO
 from einops import einsum, rearrange
 from jaxtyping import Float, Int, Bool
 import numpy.typing as npt
 import numpy as np
+import os
 
 
 class Linear(nn.Module):
@@ -353,3 +354,22 @@ def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device
     data = dataset[idx]
     label = dataset[idx + 1]
     return (torch.from_numpy(data).to(device), torch.from_numpy(label).to(device))
+
+
+def save_checkpoint(model: torch.nn.Module,
+                    optimizer: torch.optim.Optimizer,
+                    iteration: int,
+                    out: str | os.PathLike | BinaryIO | IO[bytes],) -> None:
+    state = {"iteration": iteration,
+             "model_state": model.state_dict(),
+             "optimizer_state": optimizer.state_dict()}
+    torch.save(state, out)
+
+
+def load_checkpoint(src: str | os.PathLike | BinaryIO | IO[bytes],
+                    model: torch.nn.Module,
+                    optimizer: torch.optim.Optimizer,) -> int:
+    state: dict[str, Any] = torch.load(src)
+    model.load_state_dict(state["model_state"])
+    optimizer.load_state_dict(state["optimizer_state"])
+    return state["iteration"]
