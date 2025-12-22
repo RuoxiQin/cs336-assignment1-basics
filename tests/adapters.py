@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.tokenizer import BPETokenizer, train_bpe
-from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock
+from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock, TransformerLM
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +401,36 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer_lm = TransformerLM(
+        vocab_size, d_model, num_heads, d_ff, rope_theta, context_length, num_layers)
+    with torch.no_grad():
+        transformer_lm.embedding.weight.copy_(
+            weights["token_embeddings.weight"])
+        for layer_i in range(num_layers):
+            block = transformer_lm.transformer_blocks[layer_i]
+            assert isinstance(block, TransformerBlock)
+            block.multi_head_self_attention.linear_Q.weight.copy_(
+                weights[f"layers.{layer_i}.attn.q_proj.weight"])
+            block.multi_head_self_attention.linear_K.weight.copy_(
+                weights[f"layers.{layer_i}.attn.k_proj.weight"])
+            block.multi_head_self_attention.linear_V.weight.copy_(
+                weights[f"layers.{layer_i}.attn.v_proj.weight"])
+            block.multi_head_self_attention.linear_O.weight.copy_(
+                weights[f"layers.{layer_i}.attn.output_proj.weight"])
+            block.attention_pre_norm.gain.copy_(
+                weights[f"layers.{layer_i}.ln1.weight"])
+            block.swi_gated_linear_unit.linear1.weight.copy_(
+                weights[f"layers.{layer_i}.ffn.w1.weight"])
+            block.swi_gated_linear_unit.linear2.weight.copy_(
+                weights[f"layers.{layer_i}.ffn.w2.weight"])
+            block.swi_gated_linear_unit.linear3.weight.copy_(
+                weights[f"layers.{layer_i}.ffn.w3.weight"])
+            block.feed_forward_pre_norm.gain.copy_(
+                weights[f"layers.{layer_i}.ln2.weight"])
+        transformer_lm.final_rms_norm.gain.copy_(weights["ln_final.weight"])
+        transformer_lm.final_linear.weight.copy_(weights["lm_head.weight"])
+
+    return transformer_lm(in_indices)
 
 
 def run_rmsnorm(

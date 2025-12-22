@@ -177,7 +177,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
             self.positional_embedding = RotaryPositionalEmbedding(
                 theta, self.d_k, max_seq_len)
 
-    def forward(self, x: Float[Tensor, " ... seq_len d_model"], token_positions: Int[torch.Tensor, "... seq_len"] | None = None):
+    def forward(self, x: Float[Tensor, " ... seq_len d_model"], token_positions: Int[torch.Tensor, "... seq_len"] | None = None) -> Float[Tensor, " ... seq_len d_model"]:
         assert x.size(-1) == self.d_model
         seq_len = x.size(-2)
 
@@ -207,7 +207,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float | None = None, max_seq_len: int | None = None):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float, max_seq_len: int):
         super().__init__()
         self.attention_pre_norm = RMSNorm(d_model)
         self.multi_head_self_attention = CausalMultiHeadSelfAttention(
@@ -215,7 +215,7 @@ class TransformerBlock(nn.Module):
         self.feed_forward_pre_norm = RMSNorm(d_model)
         self.swi_gated_linear_unit = SwiGLU(d_model, d_ff)
 
-    def forward(self, in_features: Float[Tensor, " ... seq_len d_model"]):
+    def forward(self, in_features: Float[Tensor, " ... seq_len d_model"]) -> Float[Tensor, " ... seq_len d_model"]:
         seq_len = in_features.size(-2)
         normalized_in_features = self.attention_pre_norm(in_features)
 
@@ -232,3 +232,24 @@ class TransformerBlock(nn.Module):
         feed_forward_output = self.swi_gated_linear_unit(
             normalized_summed_attention_output)
         return summed_attention_output + feed_forward_output
+
+
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, num_heads: int, d_ff: int, rope_theta: float, context_length: int, num_layers: int) -> None:
+        super().__init__()
+        self.context_length = context_length
+        self.embedding = Embedding(
+            num_embeddings=vocab_size, embedding_dim=d_model)
+        self.transformer_blocks = nn.ModuleList([TransformerBlock(
+            d_model, num_heads, d_ff, theta=rope_theta, max_seq_len=context_length) for _ in range(num_layers)])
+        self.final_rms_norm = RMSNorm(d_model)
+        self.final_linear = Linear(d_model, vocab_size)
+
+    def forward(self, in_indices: Int[Tensor, " ... seq_len"]):
+        assert in_indices.size(-1) <= self.context_length
+
+        x = self.embedding(in_indices)
+        for transformer_block in self.transformer_blocks:
+            x = transformer_block(x)
+        x = self.final_rms_norm(x)
+        return self.final_linear(x)
