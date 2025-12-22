@@ -74,7 +74,8 @@ class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None):
         super().__init__()
         # d_k is the dimension of the key or query vectors
-        assert d_k % 2 == 0
+        if d_k % 2 != 0:
+            raise ValueError(f"d_k is not even: {d_k}.")
         self.d_k = d_k
         self.max_seq_len = max_seq_len
         # A list of thetas [theta_0, theta_1, ..., theta_(d_k/2 - 1)].
@@ -96,9 +97,13 @@ class RotaryPositionalEmbedding(nn.Module):
         self.sin_by_i_k: torch.Tensor
 
     def forward(self, x: Float[torch.Tensor, "... seq_len d_k"], token_positions: Int[torch.Tensor, "... seq_len"]) -> Float[torch.Tensor, "... seq_len d_k"]:
-        assert x.size(-1) == self.d_k
+        if x.size(-1) != self.d_k:
+            raise ValueError(
+                f"Input x.size(-1)={x.size(-1)} doesn't match d_k={self.d_k}.")
         seq_len = x.size(-2)
-        assert seq_len <= self.max_seq_len
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Input x sequence length={seq_len} exceeds max sequence length={self.max_seq_len}.")
 
         # Note that odd is becuase it's odd for 1-based indexing.
         x_i_odd = x[..., 0::2]
@@ -110,19 +115,8 @@ class RotaryPositionalEmbedding(nn.Module):
         # Shape [..., seq_len, d_k_half]
         index = index.expand(*token_positions.shape, self.d_k//2)
 
-        # The cos_by_i_k is a cache for max_seq_len. The actual input usually has a shorter seq_len.
-        # So we only need to utilize part of the cache.
-        cos_by_i_k = self.cos_by_i_k[:seq_len, ...]
-        sin_by_i_k = self.sin_by_i_k[:seq_len, ...]
-        # Expand the cos_by_i_k and sin_by_i_k to shape [..., max_seq_len, d_k/2] to match the slicing dimension.
-        if token_positions.dim() > 1:
-            cos_by_i_k = cos_by_i_k.unsqueeze(0)
-            cos_by_i_k = cos_by_i_k.expand(*token_positions.shape, self.d_k//2)
-            sin_by_i_k = sin_by_i_k.unsqueeze(0)
-            sin_by_i_k = sin_by_i_k.expand(*token_positions.shape, self.d_k//2)
-        # Slice along the seq_len dimension. Since the last dimension is just the same integer repeated d_k/2 times, the same index will be used for the entire vector of d_k/2 lengh.
-        reordered_cos_by_i_k = torch.gather(cos_by_i_k, dim=-2, index=index)
-        reordered_sin_by_i_k = torch.gather(sin_by_i_k, dim=-2, index=index)
+        reordered_cos_by_i_k = self.cos_by_i_k[token_positions]
+        reordered_sin_by_i_k = self.sin_by_i_k[token_positions]
 
         # Element-wise multiplication. Shape: [..., seq_len, d_k/2].
         x_odd_cos_i_k = x_i_odd * reordered_cos_by_i_k
@@ -165,7 +159,9 @@ class CausalMultiHeadSelfAttention(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
-        assert d_model % num_heads == 0
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"d_model={d_model} cannot be fully divided by num_heads={num_heads}.")
         self.d_k = d_model // num_heads
         self.d_v = self.d_k
 
@@ -180,7 +176,9 @@ class CausalMultiHeadSelfAttention(nn.Module):
                 theta, self.d_k, max_seq_len)
 
     def forward(self, x: Float[Tensor, " ... seq_len d_model"], token_positions: Int[torch.Tensor, "... seq_len"] | None = None) -> Float[Tensor, " ... seq_len d_model"]:
-        assert x.size(-1) == self.d_model
+        if x.size(-1) != self.d_model:
+            raise ValueError(
+                f"Input x.size(-1)={x.size(-1)} doesn't match d_model={self.d_model}.")
         seq_len = x.size(-2)
 
         # Recover the Q, K, V from the concatenated matrix.
@@ -192,13 +190,15 @@ class CausalMultiHeadSelfAttention(nn.Module):
             x), "... seq_len (num_heads d_v) -> ... num_heads seq_len d_v", num_heads=self.num_heads)
 
         if token_positions is not None:
-            assert self.positional_embedding is not None
+            if self.positional_embedding is None:
+                raise ValueError(
+                    "token_positions is specified but the positional_embedding is not initialized.")
             Q = self.positional_embedding(Q, token_positions)
             K = self.positional_embedding(K, token_positions)
 
         # causal_mask allows Query token to attend to itself and all tokens before it.
         causal_mask = torch.tril(torch.ones(
-            seq_len, seq_len, dtype=torch.bool), diagonal=0)
+            seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=0)
         causal_mask.unsqueeze(0)
         causal_mask = causal_mask.expand(*K.shape[:-2], seq_len, seq_len)
 
@@ -217,12 +217,17 @@ class TransformerBlock(nn.Module):
         self.feed_forward_pre_norm = RMSNorm(d_model)
         self.swi_gated_linear_unit = SwiGLU(d_model, d_ff)
 
+        token_positions = torch.arange(max_seq_len)
+        self.register_buffer(
+            "token_positions", token_positions, persistent=False)
+        self.token_positions: torch.Tensor
+
     def forward(self, in_features: Float[Tensor, " ... seq_len d_model"]) -> Float[Tensor, " ... seq_len d_model"]:
         seq_len = in_features.size(-2)
         normalized_in_features = self.attention_pre_norm(in_features)
 
         # Construct the natural-ordered token_positions matrix.
-        token_positions = torch.arange(seq_len)
+        token_positions = self.token_positions[:seq_len]
         token_positions = token_positions.unsqueeze(0)
         token_positions = token_positions.expand(*in_features.shape[:-1])
 
@@ -248,7 +253,9 @@ class TransformerLM(nn.Module):
         self.final_linear = Linear(d_model, vocab_size)
 
     def forward(self, in_indices: Int[Tensor, " ... seq_len"]) -> Float[Tensor, "... seq_len vocab_size"]:
-        assert in_indices.size(-1) <= self.context_length
+        if in_indices.size(-1) > self.context_length:
+            raise ValueError(
+                f"in_indices sequence length={in_indices.size(-1)} exceeds max context_length={self.context_length}.")
 
         x = self.embedding(in_indices)
         for transformer_block in self.transformer_blocks:
