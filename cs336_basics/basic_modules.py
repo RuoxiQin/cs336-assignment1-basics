@@ -245,7 +245,7 @@ class TransformerLM(nn.Module):
         self.final_rms_norm = RMSNorm(d_model)
         self.final_linear = Linear(d_model, vocab_size)
 
-    def forward(self, in_indices: Int[Tensor, " ... seq_len"]):
+    def forward(self, in_indices: Int[Tensor, " ... seq_len"]) -> Float[Tensor, "... seq_len vocab_size"]:
         assert in_indices.size(-1) <= self.context_length
 
         x = self.embedding(in_indices)
@@ -253,3 +253,10 @@ class TransformerLM(nn.Module):
             x = transformer_block(x)
         x = self.final_rms_norm(x)
         return self.final_linear(x)
+
+
+def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
+    max_logits = inputs.amax(dim=-1, keepdim=True)
+    loss: Float[Tensor, " batch_size one"] = -torch.gather(inputs, dim=-1, index=targets.unsqueeze(
+        -1)) + max_logits + torch.log(torch.exp(inputs - max_logits).sum(dim=-1, keepdim=True))
+    return loss.mean()
