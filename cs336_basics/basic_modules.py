@@ -1,6 +1,8 @@
 import math
 import torch
 from torch import nn, Tensor
+from collections.abc import Callable, Iterable
+from typing import Optional, Any
 from einops import einsum, rearrange
 from jaxtyping import Float, Int, Bool
 
@@ -260,3 +262,44 @@ def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[
     loss: Float[Tensor, " batch_size one"] = -torch.gather(inputs, dim=-1, index=targets.unsqueeze(
         -1)) + max_logits + torch.log(torch.exp(inputs - max_logits).sum(dim=-1, keepdim=True))
     return loss.mean()
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr: float, betas: tuple[float, float], eps: float, weight_decay: float):
+        defaults = {"lr": lr, "betas": betas,
+                    "eps": eps, "weight_decay": weight_decay}
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Any:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            betas = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                t = state.get("t", 1)  # t starts from 1
+                m = state.get("m", torch.zeros_like(p))
+                v = state.get("v", torch.zeros_like(p))
+                grad = p.grad.data
+                m = betas[0] * m + (1.0-betas[0]) * grad
+                v = betas[1] * v + (1.0-betas[1]) * grad ** 2
+                alpha_t = lr * \
+                    math.sqrt(1 - betas[1] ** t) / (1 - betas[0] ** t)
+                p.data -= alpha_t * m / (torch.sqrt(v) + eps)
+                p.data *= 1 - lr * weight_decay
+
+                state["t"] = t + 1
+                state["m"] = m
+                state["v"] = v
+
+        return loss

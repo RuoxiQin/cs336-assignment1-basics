@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.tokenizer import BPETokenizer, train_bpe
-from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock, TransformerLM, cross_entropy
+from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock, TransformerLM, cross_entropy, AdamW
 
 logger = logging.getLogger(__name__)
 
@@ -546,7 +546,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
