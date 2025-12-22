@@ -5,6 +5,8 @@ from collections.abc import Callable, Iterable
 from typing import Optional, Any
 from einops import einsum, rearrange
 from jaxtyping import Float, Int, Bool
+import numpy.typing as npt
+import numpy as np
 
 
 class Linear(nn.Module):
@@ -341,3 +343,13 @@ def clip_gradient(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, 
         for param in parameters:
             if param.grad is not None:
                 param.grad.mul_(scale_factor)
+
+
+def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    starting_positions = np.random.randint(
+        low=0, high=dataset.size - context_length, size=batch_size)
+    # Use boradcast rule to construct idx of shape [batch_size, context_length]
+    idx = starting_positions[:, None] + np.arange(context_length)[None, :]
+    data = dataset[idx]
+    label = dataset[idx + 1]
+    return (torch.from_numpy(data).to(device), torch.from_numpy(label).to(device))
