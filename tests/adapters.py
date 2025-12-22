@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.tokenizer import BPETokenizer, train_bpe
-from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention
+from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +88,11 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    swiglu = SwiGLU(d_model, d_ff, dtype=w1_weight.dtype)
+    swiglu = SwiGLU(d_model, d_ff)
     with torch.no_grad():
-        swiglu.w1_weight.copy_(w1_weight)
-        swiglu.w2_weight.copy_(w2_weight)
-        swiglu.w3_weight.copy_(w3_weight)
+        swiglu.linear1.weight.copy_(w1_weight)
+        swiglu.linear2.weight.copy_(w2_weight)
+        swiglu.linear3.weight.copy_(w3_weight)
     return swiglu(in_features)
 
 
@@ -298,7 +298,28 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformer_block = TransformerBlock(
+        d_model, num_heads, d_ff, theta, max_seq_len)
+    with torch.no_grad():
+        transformer_block.multi_head_self_attention.linear_Q.weight.copy_(
+            weights["attn.q_proj.weight"])
+        transformer_block.multi_head_self_attention.linear_K.weight.copy_(
+            weights["attn.k_proj.weight"])
+        transformer_block.multi_head_self_attention.linear_V.weight.copy_(
+            weights["attn.v_proj.weight"])
+        transformer_block.multi_head_self_attention.linear_O.weight.copy_(
+            weights["attn.output_proj.weight"])
+        transformer_block.attention_pre_norm.gain.copy_(weights["ln1.weight"])
+        transformer_block.swi_gated_linear_unit.linear1.weight.copy_(
+            weights["ffn.w1.weight"])
+        transformer_block.swi_gated_linear_unit.linear2.weight.copy_(
+            weights["ffn.w2.weight"])
+        transformer_block.swi_gated_linear_unit.linear3.weight.copy_(
+            weights["ffn.w3.weight"])
+        transformer_block.feed_forward_pre_norm.gain.copy_(
+            weights["ln2.weight"])
+
+    return transformer_block(in_features)
 
 
 def run_transformer_lm(

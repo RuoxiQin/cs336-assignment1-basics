@@ -56,28 +56,16 @@ class SwiGLU(nn.Module):
 
     def __init__(self, d_model: int, d_ff: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
-        std = math.sqrt(2.0 / (d_model + d_ff))
-        self.w1_weight = nn.Parameter(
-            torch.empty(d_ff, d_model, dtype=dtype))
-        nn.init.trunc_normal_(self.w1_weight, mean=0, std=std,
-                              a=-3.0 * std, b=3.0 * std)
-        self.w2_weight = nn.Parameter(
-            torch.empty(d_model, d_ff, dtype=dtype))
-        nn.init.trunc_normal_(self.w2_weight, mean=0, std=std,
-                              a=-3.0 * std, b=3.0 * std)
-        self.w3_weight = nn.Parameter(
-            torch.empty(d_ff, d_model, dtype=dtype))
-        nn.init.trunc_normal_(self.w3_weight, mean=0, std=std,
-                              a=-3.0 * std, b=3.0 * std)
+        self.linear1 = Linear(d_model, d_ff, dtype=dtype)
+        self.linear2 = Linear(d_ff, d_model, dtype=dtype)
+        self.linear3 = Linear(d_model, d_ff, dtype=dtype)
 
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
-        gate_pre_activation = einsum(
-            x, self.w1_weight, "... d_model, d_ff d_model -> ... d_ff")
+        gate_pre_activation: Float[Tensor, "... d_ff"] = self.linear1(x)
         swish_linear_unit = gate_pre_activation * \
             torch.sigmoid(gate_pre_activation)
-        linear_pre_activation = einsum(
-            x, self.w3_weight, "... d_model, d_ff d_model -> ... d_ff")
-        return einsum(swish_linear_unit * linear_pre_activation, self.w2_weight, "... d_ff, d_model d_ff -> ... d_model")
+        linear_pre_activation: Float[Tensor, "... d_ff"] = self.linear3(x)
+        return self.linear2(swish_linear_unit * linear_pre_activation)
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -216,3 +204,31 @@ class CausalMultiHeadSelfAttention(nn.Module):
         concatenated_attentioned_value = rearrange(
             attentioned_value, "... num_heads seq_len d_v -> ... seq_len (num_heads d_v)")
         return self.linear_O(concatenated_attentioned_value)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float | None = None, max_seq_len: int | None = None):
+        super().__init__()
+        self.attention_pre_norm = RMSNorm(d_model)
+        self.multi_head_self_attention = CausalMultiHeadSelfAttention(
+            d_model, num_heads, theta, max_seq_len)
+        self.feed_forward_pre_norm = RMSNorm(d_model)
+        self.swi_gated_linear_unit = SwiGLU(d_model, d_ff)
+
+    def forward(self, in_features: Float[Tensor, " ... seq_len d_model"]):
+        seq_len = in_features.size(-2)
+        normalized_in_features = self.attention_pre_norm(in_features)
+
+        # Construct the natural-ordered token_positions matrix.
+        token_positions = torch.arange(seq_len)
+        token_positions = token_positions.unsqueeze(0)
+        token_positions = token_positions.expand(*in_features.shape[:-1])
+
+        attention_output = self.multi_head_self_attention(
+            normalized_in_features, token_positions)
+        summed_attention_output = in_features + attention_output
+        normalized_summed_attention_output = self.feed_forward_pre_norm(
+            summed_attention_output)
+        feed_forward_output = self.swi_gated_linear_unit(
+            normalized_summed_attention_output)
+        return summed_attention_output + feed_forward_output
