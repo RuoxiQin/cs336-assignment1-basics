@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     git \
+    wget \
+    tmux \
     python3-pip \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*

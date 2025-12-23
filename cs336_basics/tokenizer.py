@@ -27,15 +27,24 @@ def train_bpe_on_owt_valid():
     return train_bpe_on_data("data/owt_valid.txt", 32000, ["<|endoftext|>"])
 
 
+def get_vocab_pkl_file_path(training_data_path: str) -> str:
+    path = Path(training_data_path)
+    return str(path.with_stem(path.stem + "-vocab").with_suffix(".pkl"))
+
+
+def get_merges_pkl_file_path(training_data_path: str) -> str:
+    path = Path(training_data_path)
+    return str(path.with_stem(path.stem + "-merges").with_suffix(".pkl"))
+
 def train_bpe_on_data(path_str: str, vocab_size: int, special_tokens: list[str]):
-    logger.info(f"Started BPE training for {path_str}.")
+    logger.debug(f"Started BPE training for {path_str}.")
     vocab, merges = train_bpe(
         path_str, vocab_size, special_tokens)
-    logger.info(f"Completed BPE training for {path_str}.")
-    path = Path(path_str)
-    with open(path.with_stem(path.stem + "-vocab").with_suffix(".pkl"), "wb") as f:
+    logger.debug(f"Completed BPE training for {path_str}.")
+
+    with open(get_vocab_pkl_file_path(path_str), "wb") as f:
         pickle.dump(vocab, f)
-    with open(path.with_stem(path.stem + "-merges").with_suffix(".pkl"), "wb") as f:
+    with open(get_merges_pkl_file_path(path_str), "wb") as f:
         pickle.dump(merges, f)
 
 
@@ -122,7 +131,7 @@ def train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    logger.info("Tokenizer started.")
+    logger.debug("Tokenizer started.")
     # Initialize vocab with 256 bytes and special tokens.
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
     for special_token in special_tokens:
@@ -142,7 +151,7 @@ def train_bpe(
         for word in pre_tokenized_words:
             # Build words frequency table.
             words_frequency[word] += 1
-    logger.info("Pre-tokenization completed.")
+    logger.debug("Pre-tokenization completed.")
     # Count byte-pair frequency.
     # Double-linked list of the words bytes sequence. Only the left-most bytes of a merged bytes are valid.
     # Note that this can be further optimized by storing word_frequency, words, words_bytes in a single object.
@@ -209,12 +218,12 @@ def train_bpe(
             bytes_pair = (bytes([word_bytes[i]]), bytes([word_bytes[i+1]]))
             increase_bytes_pair_frequency(bytes_pair, count)
             bytes_pair_occurance[bytes_pair][(word_i, i)] = None
-    logger.info("Tokenizer initial frequency tables creation completed.")
+    logger.debug("Tokenizer initial frequency tables creation completed.")
 
     # BPE merge loop.
     for vocab_i in range(len(vocab), vocab_size):
         if vocab_i % 100 == 0:
-            logger.info(f"Starting BPE merge loop {vocab_i}.")
+            logger.debug(f"Starting BPE merge loop {vocab_i}.")
         # Get the most frequent bytes_pair. If there is a tie, further sort lexicographically by bytes_pairs.
         most_frequent_bytes_pair = get_most_frequent_bytes_pair()
         if not most_frequent_bytes_pair:
@@ -324,7 +333,7 @@ class BPETokenizer:
         return BPETokenizer(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> list[int]:
-        logger.info("Started BPE encoding.")
+        logger.debug("Started BPE encoding.")
         # Split pattern that also keep special token strings as an individual element.
         # Note that empty split_pattern raises error.
         if self.special_tokens_split_pattern:
@@ -340,7 +349,7 @@ class BPETokenizer:
         next: list[list[list[int]]] = []
         prev: list[list[list[int]]] = []
 
-        logger.info("Started building encoding index.")
+        logger.debug("Started building encoding index.")
         for text_i, text_part in enumerate(text_parts):
             words_bytes.append([])
             next.append([])
@@ -365,7 +374,7 @@ class BPETokenizer:
                     bytes_pair_occurance[(
                         word_bytes[bytes_i:bytes_i+1], word_bytes[bytes_i+1:bytes_i+2])][(text_i, word_i, bytes_i)] = None
 
-        logger.info("Started encoding.")
+        logger.debug("Started encoding.")
 
         def delete_bytes_pair_occurance(bytes_pair: tuple[bytes, bytes], occurance: tuple[int, int, int]):
             bytes_pair_occurance[bytes_pair].pop(occurance)
@@ -435,7 +444,7 @@ class BPETokenizer:
             word_bytes[bytes_i] = merged_bytes
             word_bytes[second_bytes_i] = b""
 
-        logger.info("Started converting merged bytes to encoding integer.")
+        logger.debug("Started converting merged bytes to encoding integer.")
         text_encode: list[list[int]] = [[] for _ in range(len(words_bytes))]
         for text_i in range(len(words_bytes)):
             for word_i in range(len(words_bytes[text_i])):
@@ -447,11 +456,18 @@ class BPETokenizer:
 
         return [encode for words_encode in text_encode for encode in words_encode]
 
-    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+    def encode_iterable(self, iterable: Iterable[str], buffer_chunk_size: int = 1024) -> Iterator[int]:
+        buffer_list = []
+        buffer_size = 0
         buffer: str = ""
 
         for new_text in iterable:
-            buffer += new_text
+            buffer_list.append(new_text)
+            buffer_size += len(new_text)
+            if buffer_size < buffer_chunk_size:
+                continue
+
+            buffer = "".join(buffer_list)
             matched_special_token_prefix_negative_index = 0
             # Check whether buffer ends at the middle of a special token.
             # To do this, only need to check the last `longest_special_token_length` chars, staring
@@ -475,8 +491,11 @@ class BPETokenizer:
                 yield from self.encode(text_to_process)
                 buffer = buffer.removeprefix(text_to_process)
 
+            buffer_list = [buffer]
+            buffer_size = len(buffer)
+
         # Encode any remaining text.
-        yield from self.encode(buffer)
+        yield from self.encode("".join(buffer_list))
 
     def decode(self, ids: list[int]) -> str:
         return b"".join([self.vocab[encoding] for encoding in ids]).decode("utf-8", errors="replace")
