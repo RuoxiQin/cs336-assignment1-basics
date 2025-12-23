@@ -1,0 +1,25 @@
+{
+    "name": "CS336-LLM-Dev",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "runArgs": [
+        "--gpus=all",
+        "--shm-size=8gb" // For pytorch memory sharing.
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python"
+            ],
+            "settings": {
+                // Use the uv python as interpreter.
+                "python.defaultInterpreterPath": "/usr/local/uv_venv/bin/python"
+            }
+        }
+    },
+    // Install all the packages after the Docker is built.
+    "postCreateCommand": "uv sync",
+    "remoteUser": "root"
+}

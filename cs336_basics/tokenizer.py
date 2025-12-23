@@ -292,6 +292,7 @@ class BPETokenizer:
         self.vocab = vocab
         self.reverse_vocab = {v: k for k, v in vocab.items()}
         self.merges = merges
+        self.merge_ranks = {pair: i for i, pair in enumerate(merges)}
         if special_tokens:
             # The split pattern keeps the special token as a split result as well.
             # Sort the special_tokens by length so if one special token is part of another, the longer
@@ -371,36 +372,68 @@ class BPETokenizer:
             if not bytes_pair_occurance[bytes_pair]:
                 del bytes_pair_occurance[bytes_pair]
 
-        for bytes_pair in self.merges:
-            while bytes_pair_occurance[bytes_pair]:
-                text_i, word_i, bytes_i = bytes_pair_occurance[bytes_pair].popitem(last=False)[
-                    0]
-                word_bytes = words_bytes[text_i][word_i]
-                second_bytes_i = next[text_i][word_i][bytes_i]
-                merged_bytes = bytes_pair[0] + bytes_pair[1]
-                # Update occurance of bytes before bytes-pair.
-                before_bytes_i = prev[text_i][word_i][bytes_i]
-                if before_bytes_i >= 0:
-                    before_bytes = word_bytes[before_bytes_i]
-                    delete_bytes_pair_occurance(
-                        (before_bytes, bytes_pair[0]), (text_i, word_i, before_bytes_i))
-                    bytes_pair_occurance[(before_bytes, merged_bytes)][(
-                        text_i, word_i, before_bytes_i)] = None
-                # Update occurance of bytes after bytes-pair.
-                after_bytes_i = next[text_i][word_i][second_bytes_i]
-                if after_bytes_i >= 0:
-                    after_bytes = word_bytes[after_bytes_i]
-                    delete_bytes_pair_occurance(
-                        (bytes_pair[1], after_bytes), (text_i, word_i, second_bytes_i))
-                    bytes_pair_occurance[(merged_bytes, after_bytes)][(
-                        text_i, word_i, bytes_i)] = None
-                # Update double-linked list.
-                next[text_i][word_i][bytes_i] = after_bytes_i
-                if after_bytes_i >= 0:
-                    prev[text_i][word_i][after_bytes_i] = bytes_i
-                # Update merged bytes-pair.
-                word_bytes[bytes_i] = merged_bytes
-                word_bytes[second_bytes_i] = b""
+        # 1. Initialize Heap with only pairs that exist in this text.
+        bytes_pair_by_rank_pq = []
+        for pair, occurrences in bytes_pair_occurance.items():
+            if pair in self.merge_ranks:
+                rank = self.merge_ranks[pair]
+                for occ in occurrences:
+                    # Store (rank, (text_i, word_i, bytes_i), pair)
+                    heapq.heappush(bytes_pair_by_rank_pq, (rank, occ, pair))
+
+        while bytes_pair_by_rank_pq:
+            rank, (text_i, word_i, bytes_i), bytes_pair = heapq.heappop(
+                bytes_pair_by_rank_pq)
+
+            # Validate that the pair still exists (hasn't been merged by a previous step)
+            if words_bytes[text_i][word_i][bytes_i] != bytes_pair[0]:
+                continue
+            second_bytes_i = next[text_i][word_i][bytes_i]
+            if second_bytes_i == -1 or words_bytes[text_i][word_i][second_bytes_i] != bytes_pair[1]:
+                continue
+
+            text_i, word_i, bytes_i = bytes_pair_occurance[bytes_pair].popitem(last=False)[
+                0]
+            word_bytes = words_bytes[text_i][word_i]
+            second_bytes_i = next[text_i][word_i][bytes_i]
+            merged_bytes = bytes_pair[0] + bytes_pair[1]
+            # Update occurance of bytes before bytes-pair.
+            before_bytes_i = prev[text_i][word_i][bytes_i]
+            if before_bytes_i >= 0:
+                before_bytes = word_bytes[before_bytes_i]
+                delete_bytes_pair_occurance(
+                    (before_bytes, bytes_pair[0]), (text_i, word_i, before_bytes_i))
+
+                new_bytes_pair = (before_bytes, merged_bytes)
+                new_bytes_pair_occurance = (text_i, word_i, before_bytes_i)
+                bytes_pair_occurance[new_bytes_pair][new_bytes_pair_occurance] = None
+                # Push the new bytes_pair to heap.
+                if new_bytes_pair in self.merge_ranks:
+                    heapq.heappush(bytes_pair_by_rank_pq, (
+                        self.merge_ranks[new_bytes_pair], new_bytes_pair_occurance, new_bytes_pair))
+
+            # Update occurance of bytes after bytes-pair.
+            after_bytes_i = next[text_i][word_i][second_bytes_i]
+            if after_bytes_i >= 0:
+                after_bytes = word_bytes[after_bytes_i]
+                delete_bytes_pair_occurance(
+                    (bytes_pair[1], after_bytes), (text_i, word_i, second_bytes_i))
+
+                new_bytes_pair = (merged_bytes, after_bytes)
+                new_bytes_pair_occurance = (text_i, word_i, bytes_i)
+                bytes_pair_occurance[new_bytes_pair][new_bytes_pair_occurance] = None
+                # Push the new bytes_pair to heap.
+                if new_bytes_pair in self.merge_ranks:
+                    heapq.heappush(bytes_pair_by_rank_pq, (
+                        self.merge_ranks[new_bytes_pair], new_bytes_pair_occurance, new_bytes_pair))
+
+            # Update double-linked list.
+            next[text_i][word_i][bytes_i] = after_bytes_i
+            if after_bytes_i >= 0:
+                prev[text_i][word_i][after_bytes_i] = bytes_i
+            # Update merged bytes-pair.
+            word_bytes[bytes_i] = merged_bytes
+            word_bytes[second_bytes_i] = b""
 
         logger.info("Started converting merged bytes to encoding integer.")
         text_encode: list[list[int]] = [[] for _ in range(len(words_bytes))]
