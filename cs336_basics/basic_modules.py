@@ -4,12 +4,15 @@ from torch import nn, Tensor
 from collections.abc import Callable, Iterable
 from typing import Optional, Any, BinaryIO, IO
 from einops import einsum, rearrange
-from jaxtyping import Float, Int, Bool
+from jaxtyping import Float, Int, Bool, jaxtyped
+from typeguard import typechecked
 import numpy.typing as npt
 import numpy as np
 import os
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
@@ -21,10 +24,12 @@ class Linear(nn.Module):
         nn.init.trunc_normal_(self.weight, mean=0, std=std,
                               a=-3.0 * std, b=3.0 * std)
 
-    def forward(self, x: Float[Tensor, "... d_in"]) -> Float[Tensor, "... d_out"]:
+    def forward(self, x: Float[Tensor, "*batch d_in"]) -> Float[Tensor, "*batch d_out"]:
         return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class Embedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
@@ -32,10 +37,12 @@ class Embedding(nn.Module):
             num_embeddings, embedding_dim, dtype=dtype))
         nn.init.trunc_normal_(self.weight, 0, 1, -3, 3)
 
-    def forward(self, token_ids: Int[Tensor, "... seq_len"]) -> Float[Tensor, "... seq_len d_model"]:
+    def forward(self, token_ids: Int[Tensor, "*batch seq_len"]) -> Float[Tensor, "*batch seq_len d_model"]:
         return self.weight[token_ids]
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
@@ -44,16 +51,22 @@ class RMSNorm(nn.Module):
         self.gain = nn.Parameter(torch.ones(
             d_model, dtype=dtype))
 
-    def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+    def forward(self, x: Float[Tensor, "*batch d_model"]) -> Float[Tensor, "*batch d_model"]:
         in_dtype = x.dtype
         x = x.to(torch.float32)
-        rms: Float[Tensor, "... one"] = torch.rsqrt(torch.sum(x**2, -1, keepdim=True) /
-                                                    self.d_model + self.eps)
+        rms: Float[Tensor, "*batch 1"] = torch.rsqrt(torch.sum(x**2, -1, keepdim=True) /
+                                                     self.d_model + self.eps)
         result = einsum(x, self.gain, rms,
                         "... d_model, d_model, ... one -> ... d_model")
         return result.to(in_dtype)
 
 
+def silu(x: Float[Tensor, "*batch"]) -> Float[Tensor, "*batch"]:
+    return x * torch.sigmoid(x)
+
+
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class SwiGLU(nn.Module):
     """
     Postion-wise Feed-Forward Network with SwiGLU activation.
@@ -65,14 +78,28 @@ class SwiGLU(nn.Module):
         self.linear2 = Linear(d_ff, d_model, dtype=dtype)
         self.linear3 = Linear(d_model, d_ff, dtype=dtype)
 
-    def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
-        gate_pre_activation: Float[Tensor, "... d_ff"] = self.linear1(x)
-        swish_linear_unit = gate_pre_activation * \
-            torch.sigmoid(gate_pre_activation)
-        linear_pre_activation: Float[Tensor, "... d_ff"] = self.linear3(x)
-        return self.linear2(swish_linear_unit * linear_pre_activation)
+    def forward(self, x: Float[Tensor, "*batch d_model"]) -> Float[Tensor, "*batch d_model"]:
+        return self.linear2(silu(self.linear1(x)) * self.linear3(x))
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
+class SiLU(nn.Module):
+    """
+    Postion-wise Feed-Forward Network with SiLU activation.
+    """
+
+    def __init__(self, d_model: int, d_ff: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        super().__init__()
+        self.linear1 = Linear(d_model, d_ff, dtype=dtype)
+        self.linear2 = Linear(d_ff, d_model, dtype=dtype)
+
+    def forward(self, x: Float[Tensor, "*batch d_model"]) -> Float[Tensor, "*batch d_model"]:
+        return self.linear2(silu(self.linear1(x)))
+
+
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None):
         super().__init__()
@@ -99,7 +126,16 @@ class RotaryPositionalEmbedding(nn.Module):
         self.cos_by_i_k: torch.Tensor
         self.sin_by_i_k: torch.Tensor
 
-    def forward(self, x: Float[torch.Tensor, "... seq_len d_k"], token_positions: Int[torch.Tensor, "... seq_len"]) -> Float[torch.Tensor, "... seq_len d_k"]:
+    def forward(self, x: Float[torch.Tensor, "*batch seq_len d_k"], token_positions: Int[torch.Tensor, "*batch seq_len"]) -> Float[torch.Tensor, "*batch seq_len d_k"]:
+        # Check the token_positions can be broadcast to x.shape[-1]. Usually token_positions.shape:
+        #   1. Has the exact same shape as x.shape[-1] so every batch may have their own token_positions; OR
+        #   2. All batches share the same token_positions. So it's 1-dim, or 2-dim where first dim is 1.
+        try:
+            torch.broadcast_shapes(x.shape[:-1], token_positions.shape)
+        except RuntimeError:
+            raise ValueError(
+                f"token_positions {token_positions.shape} cannot be broadcast to x {x.shape[:-1]}")
+
         if x.size(-1) != self.d_k:
             raise ValueError(
                 f"Input x.size(-1)={x.size(-1)} doesn't match d_k={self.d_k}.")
@@ -111,12 +147,6 @@ class RotaryPositionalEmbedding(nn.Module):
         # Note that odd is becuase it's odd for 1-based indexing.
         x_i_odd = x[..., 0::2]
         x_i_even = x[..., 1::2]
-
-        # Expand the token_positions to shape of [..., seq_len, d_k/2] for slicing.
-        # Note that expand means we simply duplicate the last int element to an int vector of d_k/2 length.
-        index = token_positions.unsqueeze(-1)  # Shape [..., seq_len, 1]
-        # Shape [..., seq_len, d_k_half]
-        index = index.expand(*token_positions.shape, self.d_k//2)
 
         reordered_cos_by_i_k = self.cos_by_i_k[token_positions]
         reordered_sin_by_i_k = self.sin_by_i_k[token_positions]
@@ -136,18 +166,22 @@ class RotaryPositionalEmbedding(nn.Module):
             stacked_new_x_odd_even, "... seq_len d_k_half two -> ... seq_len (d_k_half two)")
 
 
-def softmax(x: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+@jaxtyped(typechecker=typechecked)
+@typechecked
+def softmax(x: Float[Tensor, "*batch"], dim: int) -> Float[Tensor, "*batch"]:
     x = x - x.amax(dim, keepdim=True)
     exp_x = torch.exp(x)
     return exp_x / exp_x.sum(dim, keepdim=True)
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 def scaled_dot_product_attention(
-    Q: Float[Tensor, " ... queries d_k"],
-    K: Float[Tensor, " ... keys d_k"],
-    V: Float[Tensor, " ... keys d_v"],
-    mask: Bool[Tensor, " ... queries keys"] | None = None,
-) -> Float[Tensor, " ... queries d_v"]:
+    Q: Float[Tensor, "*batch queries d_k"],
+    K: Float[Tensor, "*batch keys d_k"],
+    V: Float[Tensor, "*batch keys d_v"],
+    mask: Bool[Tensor, "*batch queries keys"] | None = None,
+) -> Float[Tensor, "*batch queries d_v"]:
     d_k = Q.size(-1)
     QK = einsum(Q, K, "... queries d_k, ... keys d_k -> ... queries keys")
     if mask is not None:
@@ -157,6 +191,8 @@ def scaled_dot_product_attention(
     return einsum(similarity_weight, V, "... queries keys, ... keys d_v -> ... queries d_v")
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class CausalMultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, theta: float | None = None, max_seq_len: int | None = None) -> None:
         super().__init__()
@@ -178,7 +214,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
             self.positional_embedding = RotaryPositionalEmbedding(
                 theta, self.d_k, max_seq_len)
 
-    def forward(self, x: Float[Tensor, " ... seq_len d_model"], token_positions: Int[torch.Tensor, "... seq_len"] | None = None) -> Float[Tensor, " ... seq_len d_model"]:
+    def forward(self, x: Float[Tensor, " *batch seq_len d_model"], token_positions: Int[torch.Tensor, "*batch seq_len"] | None = None) -> Float[Tensor, " *batch seq_len d_model"]:
         if x.size(-1) != self.d_model:
             raise ValueError(
                 f"Input x.size(-1)={x.size(-1)} doesn't match d_model={self.d_model}.")
@@ -211,6 +247,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         return self.linear_O(concatenated_attentioned_value)
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float, max_seq_len: int):
         super().__init__()
@@ -225,14 +263,12 @@ class TransformerBlock(nn.Module):
             "token_positions", token_positions, persistent=False)
         self.token_positions: torch.Tensor
 
-    def forward(self, in_features: Float[Tensor, " ... seq_len d_model"]) -> Float[Tensor, " ... seq_len d_model"]:
+    def forward(self, in_features: Float[Tensor, " *batch seq_len d_model"]) -> Float[Tensor, " *batch seq_len d_model"]:
         seq_len = in_features.size(-2)
         normalized_in_features = self.attention_pre_norm(in_features)
 
         # Construct the natural-ordered token_positions matrix.
         token_positions = self.token_positions[:seq_len]
-        token_positions = token_positions.unsqueeze(0)
-        token_positions = token_positions.expand(*in_features.shape[:-1])
 
         attention_output = self.multi_head_self_attention(
             normalized_in_features, token_positions)
@@ -244,6 +280,8 @@ class TransformerBlock(nn.Module):
         return summed_attention_output + feed_forward_output
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class TransformerLM(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, num_heads: int, d_ff: int, rope_theta: float, context_length: int, num_layers: int) -> None:
         super().__init__()
@@ -255,7 +293,7 @@ class TransformerLM(nn.Module):
         self.final_rms_norm = RMSNorm(d_model)
         self.final_linear = Linear(d_model, vocab_size)
 
-    def forward(self, in_indices: Int[Tensor, " ... seq_len"]) -> Float[Tensor, "... seq_len vocab_size"]:
+    def forward(self, in_indices: Int[Tensor, " *batch seq_len"]) -> Float[Tensor, "*batch seq_len vocab_size"]:
         if in_indices.size(-1) > self.context_length:
             raise ValueError(
                 f"in_indices sequence length={in_indices.size(-1)} exceeds max context_length={self.context_length}.")
@@ -267,15 +305,19 @@ class TransformerLM(nn.Module):
         return self.final_linear(x)
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 def cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
     max_logits = inputs.amax(dim=-1, keepdim=True)
     loss: Float[Tensor, " batch_size one"] = -torch.gather(inputs, dim=-1, index=targets.unsqueeze(
-        -1)) + max_logits + torch.log(torch.exp(inputs - max_logits).sum(dim=-1, keepdim=True))
+        -1).long()) + max_logits + torch.log(torch.exp(inputs - max_logits).sum(dim=-1, keepdim=True))
     return loss.mean()
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 class AdamW(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, betas: tuple[float, float], eps: float, weight_decay: float):
+    def __init__(self, params, lr: float, betas: tuple[float, float], weight_decay: float = 0.1, eps: float = 1e-8):
         defaults = {"lr": lr, "betas": betas,
                     "eps": eps, "weight_decay": weight_decay}
         super().__init__(params, defaults)
@@ -315,6 +357,8 @@ class AdamW(torch.optim.Optimizer):
         return loss
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 def get_lr_cosine_schedule(it: int,
                            max_learning_rate: float,
                            min_learning_rate: float,
@@ -327,6 +371,8 @@ def get_lr_cosine_schedule(it: int,
     return min_learning_rate
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 @torch.no_grad()
 def clip_gradient(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6) -> None:
     """
@@ -346,6 +392,8 @@ def clip_gradient(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, 
                 param.grad.mul_(scale_factor)
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     starting_positions = np.random.randint(
         low=0, high=dataset.size - context_length, size=batch_size)
@@ -356,20 +404,27 @@ def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device
     return (torch.from_numpy(data).to(device), torch.from_numpy(label).to(device))
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 def save_checkpoint(model: torch.nn.Module,
                     optimizer: torch.optim.Optimizer,
                     iteration: int,
-                    out: str | os.PathLike | BinaryIO | IO[bytes],) -> None:
+                    out: str | os.PathLike | BinaryIO | IO[bytes],
+                    wandb_run_id: str | None = None,) -> None:
     state = {"iteration": iteration,
              "model_state": model.state_dict(),
-             "optimizer_state": optimizer.state_dict()}
+             "optimizer_state": optimizer.state_dict(),
+             "wandb_run_id": wandb_run_id}
     torch.save(state, out)
 
 
+@jaxtyped(typechecker=typechecked)
+@typechecked
 def load_checkpoint(src: str | os.PathLike | BinaryIO | IO[bytes],
                     model: torch.nn.Module,
-                    optimizer: torch.optim.Optimizer,) -> int:
+                    optimizer: torch.optim.Optimizer | None,) -> dict[str, Any]:
     state: dict[str, Any] = torch.load(src)
     model.load_state_dict(state["model_state"])
-    optimizer.load_state_dict(state["optimizer_state"])
-    return state["iteration"]
+    if optimizer is not None:
+        optimizer.load_state_dict(state["optimizer_state"])
+    return {"iteration": state["iteration"], "wandb_run_id": state.get("wandb_run_id", None)}

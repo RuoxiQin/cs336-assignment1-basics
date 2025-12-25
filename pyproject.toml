@@ -19,6 +19,8 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "ty>=0.0.1a16",
+    "typeguard==2.13.3", # for runtime jax tensor typechecking
+    "python-dotenv",
 ]
 
 [build-system]

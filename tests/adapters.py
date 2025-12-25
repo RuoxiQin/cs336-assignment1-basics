@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.tokenizer import BPETokenizer, train_bpe
-from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock, TransformerLM, cross_entropy, AdamW, get_lr_cosine_schedule, clip_gradient, get_batch, save_checkpoint, load_checkpoint
+from cs336_basics.basic_modules import Linear, Embedding, RMSNorm, SwiGLU, RotaryPositionalEmbedding, softmax, scaled_dot_product_attention, CausalMultiHeadSelfAttention, TransformerBlock, TransformerLM, cross_entropy, AdamW, get_lr_cosine_schedule, clip_gradient, get_batch, save_checkpoint, load_checkpoint, SiLU, silu
 
 logger = logging.getLogger(__name__)
 
@@ -470,7 +470,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return silu(in_features)
 
 
 def run_get_batch(
@@ -614,7 +614,8 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    return load_checkpoint(src, model, optimizer)
+    loaded_checkpoint = load_checkpoint(src, model, optimizer)
+    return loaded_checkpoint["iteration"]
 
 
 def get_tokenizer(
