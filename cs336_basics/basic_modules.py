@@ -168,9 +168,10 @@ class RotaryPositionalEmbedding(nn.Module):
 
 @jaxtyped(typechecker=typechecked)
 @typechecked
-def softmax(x: Float[Tensor, "*batch"], dim: int) -> Float[Tensor, "*batch"]:
-    x = x - x.amax(dim, keepdim=True)
-    exp_x = torch.exp(x)
+def softmax(x: Float[Tensor, "*batch"], dim: int, temperature: float = 1.0) -> Float[Tensor, "*batch"]:
+    scaled_x = x / temperature
+    scaled_x = scaled_x - scaled_x.amax(dim, keepdim=True)
+    exp_x = torch.exp(scaled_x)
     return exp_x / exp_x.sum(dim, keepdim=True)
 
 
@@ -428,3 +429,35 @@ def load_checkpoint(src: str | os.PathLike | BinaryIO | IO[bytes],
     if optimizer is not None:
         optimizer.load_state_dict(state["optimizer_state"])
     return {"iteration": state["iteration"], "wandb_run_id": state.get("wandb_run_id", None)}
+
+
+@jaxtyped(typechecker=typechecked)
+@typechecked
+def top_p_filter(probs: Float[Tensor, "*batch_size vocab_size"], p: float) -> Float[Tensor, "*batch_size vocab_size"]:
+    # Sort probabilities in descending order
+    # sorted_probs: the values, sorted_indices: their original positions
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+
+    # Compute cumulative probabilities
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Create a mask for tokens to remove
+    # We want to keep tokens where the cumulative probability (up to that point)
+    # is <= p. Everything after the first token that crosses 'p' gets masked.
+    # We shift the mask by one to ensure the first token that exceeds 'p' is KEPT.
+    removed_mask = cumulative_probs > p
+    removed_mask[..., 1:] = removed_mask[..., :-1].clone()
+    removed_mask[..., 0] = False
+
+    # Zero out the probabilities of the masked tokens
+    sorted_probs[removed_mask] = 0.0
+
+    # Re-normalize the remaining probabilities
+    sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+
+    # Scatter the values back to their original indices
+    # We create a zero tensor and "put back" the remaining probabilities
+    output = torch.zeros_like(probs)
+    output.scatter_(dim=-1, index=sorted_indices, src=sorted_probs)
+
+    return output

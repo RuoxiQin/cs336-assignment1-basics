@@ -9,7 +9,7 @@ import logging
 import argparse
 import torch
 from dotenv import load_dotenv
-from basic_modules import TransformerLM, load_checkpoint, softmax
+from basic_modules import TransformerLM, load_checkpoint, softmax, top_p_filter
 from cs336_basics.tokenizer import BPETokenizer, get_merges_pkl_file_path, get_vocab_pkl_file_path
 
 
@@ -44,6 +44,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_layers", type=int, default=4,)
     parser.add_argument("--device", type=str, default="cuda",)
     parser.add_argument("--max_output_tokens", type=int, default="512",)
+    parser.add_argument("--temperature", type=float, default=0.9,)
+    parser.add_argument("--top_p", type=float, default=0.8,)
 
     args = parser.parse_args()
 
@@ -73,7 +75,7 @@ if __name__ == "__main__":
         prompt = input("Enter prompt (or 'exit' to quit): ")
         if prompt.lower() == 'exit':
             break
-        
+
         num_generated_tokens = 0
         while num_generated_tokens < args.max_output_tokens and prompt[-13:] != "<|endoftext|>":
             # Tokenize the prompt (including previously generated tokens)
@@ -81,13 +83,16 @@ if __name__ == "__main__":
             prompt_token_tensor = torch.tensor(prompt_tokens, dtype=torch.int32).unsqueeze(
                 0).to(args.device)  # Shape: (1, seq_len)
 
-            predicted_logits = transformer_lm(prompt_token_tensor)  # Shape: (1, seq_len, vocab_size)
+            predicted_logits = transformer_lm(
+                prompt_token_tensor)[-1, -1, :]  # Shape: (vocab_size,)
             next_token_probablities = softmax(
-                predicted_logits[-1, -1, :], dim=-1)  # Shape: (vocab_size,)
+                predicted_logits, dim=-1, temperature=args.temperature)
+            next_token_probablities = top_p_filter(
+                next_token_probablities, p=args.top_p)
             next_token = torch.multinomial(
                 next_token_probablities, num_samples=1)  # Shape: (1,)
             prompt_tokens += next_token.tolist()
             num_generated_tokens += 1
             prompt = tokenizer.decode(prompt_tokens)
 
-        print(f"Generated story: {prompt}\n")
+        print(f"Generated story:\n{prompt}\n")
