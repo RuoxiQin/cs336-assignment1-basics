@@ -375,22 +375,28 @@ def get_lr_cosine_schedule(it: int,
 @jaxtyped(typechecker=typechecked)
 @typechecked
 @torch.no_grad()
-def clip_gradient(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6) -> None:
+def clip_gradient(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6) -> Float[Tensor, ""]:
     """
-    Clip gradient in-place.
+    Clip gradient in-place without GPU-CPU sync.
 
     The l2_norm is computed as if all paramters concatenates to a single vector and then compute its l2_norm.
     """
-    total_l2_norm_square: float = 0.0
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+
+    total_l2_norm_square = torch.tensor(0.0, device=grads[0].device)
+    for grad in grads:
+        total_l2_norm_square += grad.detach().norm(p=2) ** 2
+    total_l2_norm = total_l2_norm_square.sqrt()
+
+    scale_factor = (max_l2_norm / (total_l2_norm + eps)).clamp(max=1.0)
+
     for param in parameters:
         if param.grad is not None:
-            total_l2_norm_square += param.grad.norm(p=2).item() ** 2
-    total_l2_norm = total_l2_norm_square ** 0.5
-    if total_l2_norm > max_l2_norm:
-        scale_factor = max_l2_norm / (total_l2_norm + eps)
-        for param in parameters:
-            if param.grad is not None:
-                param.grad.mul_(scale_factor)
+            param.grad.mul_(scale_factor)
+
+    return total_l2_norm
 
 
 @jaxtyped(typechecker=typechecked)
@@ -402,7 +408,12 @@ def get_batch(dataset: npt.NDArray, batch_size: int, context_length: int, device
     idx = starting_positions[:, None] + np.arange(context_length)[None, :]
     data = dataset[idx]
     label = dataset[idx + 1]
-    return (torch.from_numpy(data).to(device), torch.from_numpy(label).to(device))
+    if "cuda" not in device:
+        return (torch.from_numpy(data).to(device), torch.from_numpy(label).to(device))
+    # Otherwise, pin the memory to speed up the transfer to GPU.
+    data_cpu = torch.from_numpy(data).pin_memory()
+    label_cpu = torch.from_numpy(label).pin_memory()
+    return (data_cpu.to(device, non_blocking=True), label_cpu.to(device, non_blocking=True))
 
 
 @jaxtyped(typechecker=typechecked)
@@ -411,11 +422,13 @@ def save_checkpoint(model: torch.nn.Module,
                     optimizer: torch.optim.Optimizer,
                     iteration: int,
                     out: str | os.PathLike | BinaryIO | IO[bytes],
-                    wandb_run_id: str | None = None,) -> None:
+                    wandb_run_id: str | None = None,
+                    config: dict[str, Any] | None = None) -> None:
     state = {"iteration": iteration,
              "model_state": model.state_dict(),
              "optimizer_state": optimizer.state_dict(),
-             "wandb_run_id": wandb_run_id}
+             "wandb_run_id": wandb_run_id,
+             "config": config}
     torch.save(state, out)
 
 
@@ -428,7 +441,7 @@ def load_checkpoint(src: str | os.PathLike | BinaryIO | IO[bytes],
     model.load_state_dict(state["model_state"])
     if optimizer is not None:
         optimizer.load_state_dict(state["optimizer_state"])
-    return {"iteration": state["iteration"], "wandb_run_id": state.get("wandb_run_id", None)}
+    return {"iteration": state["iteration"], "wandb_run_id": state.get("wandb_run_id", None), "config": state.get("config", None)}
 
 
 @jaxtyped(typechecker=typechecked)

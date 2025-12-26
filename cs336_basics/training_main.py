@@ -2,6 +2,7 @@
 Run Transformer LM training.
 
 uv run python cs336_basics/training_main.py \
+--wandb_project_name="cs336-basics-tinystories-async" \
 --training_token_file_path="data/TinyStoriesV2-GPT4-train-tokens.dat" \
 --testing_token_file_path="data/TinyStoriesV2-GPT4-valid-tokens.dat" \
 """
@@ -34,6 +35,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="A script to train Transformer LM.")
+    parser.add_argument("--wandb_project_name", type=str,
+                        default="cs336-basics-tinystories",)
     parser.add_argument("--training_token_file_path", type=str,
                         help="The path to the training token file.")
     parser.add_argument("--testing_token_file_path", type=str,
@@ -62,6 +65,28 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    hyperparams = {
+        "training_token_file_path": args.training_token_file_path,
+        "testing_token_file_path": args.testing_token_file_path,
+        "batch_size": args.batch_size,
+        "vocab_size": args.vocab_size,
+        "context_length": args.context_length,
+        "d_model": args.d_model,
+        "num_heads": args.num_heads,
+        "d_ff": args.d_ff,
+        "rope_theta": args.rope_theta,
+        "num_layers": args.num_layers,
+        "device": args.device,
+        "max_learning_rate": args.max_learning_rate,
+        "min_learning_rate": args.min_learning_rate,
+        "max_iters": args.max_iters,
+        "warmup_iters": args.warmup_iters,
+        "cosine_cycle_iters": args.cosine_cycle_iters,
+        "beta1": args.beta1,
+        "beta2": args.beta2,
+        "weight_decay": args.weight_decay,
+    }
+
     # Load training tokens.
     training_tokens_mmap = np.memmap(
         args.training_token_file_path,
@@ -84,7 +109,7 @@ if __name__ == "__main__":
         logger.info(
             f"Loading model and optimizer state from {args.load_model_checkpoint_path}.")
         checkpoint = load_checkpoint(args.load_model_checkpoint_path, transformer_lm,
-                                               adamw_optimizer)
+                                     adamw_optimizer)
         logger.info(
             f"Resuming training from iteration {checkpoint['iteration']}.")
         start_iteration = checkpoint["iteration"] + 1
@@ -98,30 +123,10 @@ if __name__ == "__main__":
         wandb.login()
 
         wandb_run = wandb.init(
-            project="cs336-basics-transformer-lm-tinystories",
-            config={
-                "training_token_file_path": args.training_token_file_path,
-                "testing_token_file_path": args.testing_token_file_path,
-                "batch_size": args.batch_size,
-                "vocab_size": args.vocab_size,
-                "context_length": args.context_length,
-                "d_model": args.d_model,
-                "num_heads": args.num_heads,
-                "d_ff": args.d_ff,
-                "rope_theta": args.rope_theta,
-                "num_layers": args.num_layers,
-                "device": args.device,
-                "max_learning_rate": args.max_learning_rate,
-                "min_learning_rate": args.min_learning_rate,
-                "max_iters": args.max_iters,
-                "warmup_iters": args.warmup_iters,
-                "cosine_cycle_iters": args.cosine_cycle_iters,
-                "beta1": args.beta1,
-                "beta2": args.beta2,
-                "weight_decay": args.weight_decay,
-            },
-            id = wandb_run_id,
-            resume = "allow",
+            project=args.wandb_project_name,
+            config=hyperparams,
+            id=wandb_run_id,
+            resume="allow",
         )
         # Hide the 'iter' plot itself (it's just a diagonal line)
         wandb_run.define_metric("iter", hidden=True)
@@ -166,31 +171,31 @@ if __name__ == "__main__":
         loss.backward()
 
         # Gradient clipping.
-        clip_gradient(transformer_lm.parameters(), max_l2_norm=1.0)
+        grad_l2_norm = clip_gradient(
+            transformer_lm.parameters(), max_l2_norm=1.0)
 
         # Update weights.
         adamw_optimizer.step()
 
-        # Print training loss.
+        # Log training loss and grad l2 norm.
         if iteration % 10 == 0:
-            logger.info(
-                f"Training loss at iteration {iteration}: {loss.item():.4f}")
             if wandb_run is not None:
                 wandb_run.log({
                     "iter": iteration,
-                    "train/loss": loss.item(),
+                    "train/loss": loss.detach().cpu(),
+                    "train/grad_l2_norm": grad_l2_norm.detach().cpu(),
                     "lr": current_lr,
                 })
 
-        # Compute testing loss.
-        if iteration % 500 == 0 and iteration > 0:
+        # Compute and log testing loss.
+        if iteration % 250 == 0 and iteration > 0:
             # Evaluate on testing set.
             testing_token_sequences: Int[Tensor, "batch_size context_length"]
             testing_label_token_sequences: Int[Tensor,
                                                "batch_size context_length"]
             # Reduce batch size for testing to save memory.
             testing_token_sequences, testing_label_token_sequences = get_batch(
-                testing_tokens_mmap, batch_size=args.batch_size//4, context_length=args.context_length, device=args.device)
+                testing_tokens_mmap, batch_size=args.batch_size, context_length=args.context_length, device=args.device)
 
             with torch.no_grad():
                 predicted_test_logits: Float[Tensor, "batch_size context_length vocab_size"] = transformer_lm(
@@ -201,22 +206,22 @@ if __name__ == "__main__":
                     testing_label_token_sequences, "batch_size context_length -> (batch_size context_length)")
                 test_loss: Float[Tensor, ""] = cross_entropy(
                     predicted_test_logits, testing_label_token_sequences)
-            logger.info(
-                f"Testing loss at iteration {iteration}: {test_loss.item():.4f}")
 
             if wandb_run is not None:
                 wandb_run.log({
                     "iter": iteration,
-                    "val/loss": test_loss.item(),
+                    "val/loss": test_loss.detach().cpu(),
                 })
 
         # Save model checkpoint.
         if iteration % 5000 == 0 and iteration > 0:
             training_text_path = Path(args.training_token_file_path)
             model_checkpoint_path = training_text_path.with_stem(
-                training_text_path.stem + f"_iter{iteration}").with_suffix(".pt")
+                args.wandb_project_name + f"_iter{iteration}").with_suffix(".pt")
             save_checkpoint(transformer_lm, adamw_optimizer,
-                            iteration, model_checkpoint_path)
+                            iteration, model_checkpoint_path, wandb_run_id=wandb_run.id if wandb_run is not None else None, config=hyperparams)
+            logger.info(
+                f"Saved model checkpoint to {model_checkpoint_path} at iteration {iteration}.")
 
     if wandb_run is not None:
         wandb_run.finish()
